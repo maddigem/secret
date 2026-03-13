@@ -1,18 +1,30 @@
 require("dotenv").config();
+const express = require("express");
+const fs = require("fs");
+const path = require("path");
 const { Telegraf, Markup } = require("telegraf");
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
+const RAILWAY_STATIC_URL = process.env.RAILWAY_STATIC_URL;
+const PORT = Number(process.env.PORT || 3000);
+const HOST = "0.0.0.0";
+
 if (!BOT_TOKEN) {
   throw new Error("BOT_TOKEN fehlt in der .env");
 }
 
+if (!RAILWAY_STATIC_URL) {
+  throw new Error("RAILWAY_STATIC_URL fehlt in der .env");
+}
+
 const bot = new Telegraf(BOT_TOKEN);
+const app = express();
 
 // ================= CONFIG =================
 
 const CHANNELS = {
   Private: -1003710017996,
- Extreme: -1002309468751,
+  Extreme: -1002309468751,
   PrivateVideos: -1002273059833,
 };
 
@@ -23,26 +35,96 @@ const TIERS = {
   "150": { stars: 7500, euros: 150 },
 };
 
+// ================= PERSISTENT STORAGE =================
+
+const DATA_DIR = path.join(process.cwd(), "data");
+const STATE_FILE = path.join(DATA_DIR, "user-state.json");
+
+function ensureDataDir() {
+  if (!fs.existsSync(DATA_DIR)) {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+  }
+}
+
+function loadStateFromDisk() {
+  try {
+    ensureDataDir();
+
+    if (!fs.existsSync(STATE_FILE)) {
+      return new Map();
+    }
+
+    const raw = fs.readFileSync(STATE_FILE, "utf8");
+    if (!raw.trim()) {
+      return new Map();
+    }
+
+    const parsed = JSON.parse(raw);
+    return new Map(Object.entries(parsed));
+  } catch (error) {
+    console.error("Fehler beim Laden des State-Files:", error);
+    return new Map();
+  }
+}
+
+let saveTimeout = null;
+
+function saveStateToDiskSoon() {
+  if (saveTimeout) clearTimeout(saveTimeout);
+
+  saveTimeout = setTimeout(() => {
+    try {
+      ensureDataDir();
+      const obj = Object.fromEntries(userState);
+      fs.writeFileSync(STATE_FILE, JSON.stringify(obj, null, 2), "utf8");
+    } catch (error) {
+      console.error("Fehler beim Speichern des State-Files:", error);
+    }
+  }, 150);
+}
+
+const userState = loadStateFromDisk();
+
 // ================= SIMPLE USER STATE =================
 
-const userState = new Map();
-
-function resetUser(userId) {
-  userState.set(userId, {
+function makeDefaultState() {
+  return {
     step: "idle",
     channelName: null,
     channelId: null,
     tierKey: null,
     tier: null,
     mediaType: null,
-  });
+  };
+}
+
+function resetUser(userId) {
+  userState.set(String(userId), makeDefaultState());
+  saveStateToDiskSoon();
 }
 
 function getUser(userId) {
-  if (!userState.has(userId)) {
-    resetUser(userId);
+  const key = String(userId);
+
+  if (!userState.has(key)) {
+    userState.set(key, makeDefaultState());
+    saveStateToDiskSoon();
   }
-  return userState.get(userId);
+
+  return userState.get(key);
+}
+
+function updateUser(userId, patch) {
+  const current = getUser(userId);
+  const next = { ...current, ...patch };
+  userState.set(String(userId), next);
+  saveStateToDiskSoon();
+  return next;
+}
+
+function clearFinishedUser(userId) {
+  userState.set(String(userId), makeDefaultState());
+  saveStateToDiskSoon();
 }
 
 // ================= KEYBOARDS =================
@@ -119,8 +201,7 @@ async function safeEditOrReply(ctx, text, markup) {
 }
 
 async function showChannels(ctx, userId) {
-  const state = getUser(userId);
-  state.step = "choose_channel";
+  updateUser(userId, { step: "choose_channel" });
 
   const list = Object.keys(CHANNELS)
     .map((name) => `• ${name}`)
@@ -140,7 +221,7 @@ async function showTiers(ctx, userId) {
     return showChannels(ctx, userId);
   }
 
-  state.step = "choose_tier";
+  updateUser(userId, { step: "choose_tier" });
 
   await safeEditOrReply(
     ctx,
@@ -156,7 +237,7 @@ async function showMedia(ctx, userId) {
     return showTiers(ctx, userId);
   }
 
-  state.step = "choose_media";
+  updateUser(userId, { step: "choose_media" });
 
   await safeEditOrReply(
     ctx,
@@ -166,9 +247,10 @@ async function showMedia(ctx, userId) {
 }
 
 async function askForUpload(ctx, userId, mediaType) {
-  const state = getUser(userId);
-  state.step = "wait_media";
-  state.mediaType = mediaType;
+  const state = updateUser(userId, {
+    step: "wait_media",
+    mediaType,
+  });
 
   const text =
     mediaType === "photo"
@@ -180,7 +262,12 @@ async function askForUpload(ctx, userId, mediaType) {
 
 // ================= TELEGRAM API HELPERS =================
 
-async function sendStarsInvoice({ chatId, channelName, tierKey, mediaType = "none" }) {
+async function sendStarsInvoice({
+  chatId,
+  channelName,
+  tierKey,
+  mediaType = "none",
+}) {
   const tier = TIERS[tierKey];
 
   return await bot.telegram.callApi("sendInvoice", {
@@ -238,7 +325,7 @@ bot.hears(/^start$/i, async (ctx) => {
 });
 
 bot.command("cancel", async (ctx) => {
-  resetUser(ctx.from.id);
+  clearFinishedUser(ctx.from.id);
   await ctx.reply("Vorgang abgebrochen.");
 });
 
@@ -252,7 +339,7 @@ bot.command("chatid", async (ctx) => {
 
 bot.action("cancel", async (ctx) => {
   await safeAnswerCb(ctx);
-  resetUser(ctx.from.id);
+  clearFinishedUser(ctx.from.id);
   await safeEditOrReply(ctx, "Vorgang abgebrochen.");
 });
 
@@ -275,19 +362,20 @@ bot.action(/^channel:(.+)$/, async (ctx) => {
   await safeAnswerCb(ctx);
 
   const userId = ctx.from.id;
-  const state = getUser(userId);
   const channelName = ctx.match[1];
 
   if (!(channelName in CHANNELS)) {
-    resetUser(userId);
+    clearFinishedUser(userId);
     return safeEditOrReply(ctx, "Unbekannte Gruppe / unbekannter Kanal.");
   }
 
-  state.channelName = channelName;
-  state.channelId = CHANNELS[channelName];
-  state.tierKey = null;
-  state.tier = null;
-  state.mediaType = null;
+  updateUser(userId, {
+    channelName,
+    channelId: CHANNELS[channelName],
+    tierKey: null,
+    tier: null,
+    mediaType: null,
+  });
 
   await showTiers(ctx, userId);
 });
@@ -300,13 +388,15 @@ bot.action(/^tier:(25|50|100|150)$/, async (ctx) => {
   const tierKey = ctx.match[1];
 
   if (!state.channelId) {
-    resetUser(userId);
+    clearFinishedUser(userId);
     return safeEditOrReply(ctx, "Bitte starte neu und wähle zuerst eine Gruppe.");
   }
 
-  state.tierKey = tierKey;
-  state.tier = TIERS[tierKey];
-  state.mediaType = null;
+  updateUser(userId, {
+    tierKey,
+    tier: TIERS[tierKey],
+    mediaType: null,
+  });
 
   await showMedia(ctx, userId);
 });
@@ -319,12 +409,18 @@ bot.action(/^media:(photo|video|none)$/, async (ctx) => {
   const mediaType = ctx.match[1];
 
   if (!state.channelId || !state.channelName || !state.tierKey || !state.tier) {
-    resetUser(userId);
+    clearFinishedUser(userId);
     return safeEditOrReply(ctx, "Bitte starte neu. Auswahl unvollständig.");
   }
 
   if (mediaType === "none") {
     try {
+      const summary = {
+        channelName: state.channelName,
+        euros: state.tier.euros,
+        stars: state.tier.stars,
+      };
+
       await sendStarsInvoice({
         chatId: state.channelId,
         channelName: state.channelName,
@@ -332,15 +428,15 @@ bot.action(/^media:(photo|video|none)$/, async (ctx) => {
         mediaType: "none",
       });
 
-      resetUser(userId);
+      clearFinishedUser(userId);
 
       return await safeEditOrReply(
         ctx,
-        `✅ Erfolgreich gesendet.\n\nZiel: ${state.channelName}\nPreis: ${state.tier.euros}€ / ${state.tier.stars} ⭐\nMedium: keines\n\nDie Kaufmöglichkeit erscheint in der separaten Invoice-Nachricht.`
+        `✅ Erfolgreich gesendet.\n\nZiel: ${summary.channelName}\nPreis: ${summary.euros}€ / ${summary.stars} ⭐\nMedium: keines`
       );
     } catch (error) {
       console.error("Invoice-Fehler:", error);
-      resetUser(userId);
+      clearFinishedUser(userId);
       return await safeEditOrReply(
         ctx,
         "❌ Fehler beim Senden der Stars-Invoice.\n\nPrüfe:\n- Bot ist Admin im Kanal/der Gruppe\n- Chat-ID stimmt\n- Stars/XTR ist korrekt eingerichtet"
@@ -372,10 +468,13 @@ bot.on("photo", async (ctx) => {
       return await ctx.reply("Kein Bild gefunden.");
     }
 
-    const caption = ctx.message.caption || "";
+    const summary = {
+      channelName: state.channelName,
+      euros: state.tier.euros,
+      stars: state.tier.stars,
+    };
 
-    await sendPhoto(state.channelId, photo.file_id, caption);
-
+    await sendPhoto(state.channelId, photo.file_id, ctx.message.caption || "");
     await sendStarsInvoice({
       chatId: state.channelId,
       channelName: state.channelName,
@@ -383,14 +482,14 @@ bot.on("photo", async (ctx) => {
       mediaType: "photo",
     });
 
-    await ctx.reply(
-      `✅ Erfolgreich gesendet.\n\nZiel: ${state.channelName}\nPreis: ${state.tier.euros}€ / ${state.tier.stars} ⭐\nMedium: Bild\n\nDie Kaufmöglichkeit steht in der separaten Invoice-Nachricht.`
-    );
+    clearFinishedUser(userId);
 
-    resetUser(userId);
+    await ctx.reply(
+      `✅ Erfolgreich gesendet.\n\nZiel: ${summary.channelName}\nPreis: ${summary.euros}€ / ${summary.stars} ⭐\nMedium: Bild`
+    );
   } catch (error) {
     console.error("Foto-Fehler:", error);
-    resetUser(userId);
+    clearFinishedUser(userId);
     await ctx.reply(
       "❌ Fehler beim Senden.\n\nPrüfe:\n- Bot ist Admin im Kanal/der Gruppe\n- Chat-ID stimmt\n- Bot darf Medien senden\n- Stars/XTR ist korrekt eingerichtet"
     );
@@ -416,10 +515,13 @@ bot.on("video", async (ctx) => {
       return await ctx.reply("Kein Video gefunden.");
     }
 
-    const caption = ctx.message.caption || "";
+    const summary = {
+      channelName: state.channelName,
+      euros: state.tier.euros,
+      stars: state.tier.stars,
+    };
 
-    await sendVideo(state.channelId, video.file_id, caption);
-
+    await sendVideo(state.channelId, video.file_id, ctx.message.caption || "");
     await sendStarsInvoice({
       chatId: state.channelId,
       channelName: state.channelName,
@@ -427,21 +529,20 @@ bot.on("video", async (ctx) => {
       mediaType: "video",
     });
 
-    await ctx.reply(
-      `✅ Erfolgreich gesendet.\n\nZiel: ${state.channelName}\nPreis: ${state.tier.euros}€ / ${state.tier.stars} ⭐\nMedium: Video\n\nDie Kaufmöglichkeit steht in der separaten Invoice-Nachricht.`
-    );
+    clearFinishedUser(userId);
 
-    resetUser(userId);
+    await ctx.reply(
+      `✅ Erfolgreich gesendet.\n\nZiel: ${summary.channelName}\nPreis: ${summary.euros}€ / ${summary.stars} ⭐\nMedium: Video`
+    );
   } catch (error) {
     console.error("Video-Fehler:", error);
-    resetUser(userId);
+    clearFinishedUser(userId);
     await ctx.reply(
       "❌ Fehler beim Senden.\n\nPrüfe:\n- Bot ist Admin im Kanal/der Gruppe\n- Chat-ID stimmt\n- Bot darf Medien senden\n- Stars/XTR ist korrekt eingerichtet"
     );
   }
 });
 
-// Falsche Eingabe nur dann abfangen, wenn der User gerade im Upload-Schritt ist
 bot.on("message", async (ctx, next) => {
   const userId = ctx.from?.id;
   if (!userId) return next();
@@ -488,16 +589,61 @@ bot.catch((error) => {
   console.error("BOT CRASH / ERROR:", error);
 });
 
-// ================= START BOT =================
+// ================= RAILWAY WEBHOOK SETUP =================
 
-(async () => {
+app.get("/", (_req, res) => {
+  res.status(200).send("Bot läuft");
+});
+
+app.get("/health", (_req, res) => {
+  res.status(200).json({
+    ok: true,
+    usersInState: userState.size,
+    uptime: process.uptime(),
+  });
+});
+
+const webhookPath = `/telegram/${BOT_TOKEN}`;
+const webhookUrl = `https://${RAILWAY_STATIC_URL}${webhookPath}`;
+
+app.use(bot.webhookCallback(webhookPath));
+
+app.listen(PORT, HOST, async () => {
+  console.log(`HTTP Server läuft auf ${HOST}:${PORT}`);
+  console.log(`Webhook URL: ${webhookUrl}`);
+
   try {
-    await bot.launch();
-    console.log("Bot läuft...");
+    await bot.telegram.setWebhook(webhookUrl);
+    console.log("Webhook gesetzt");
   } catch (error) {
-    console.error("Startfehler:", error);
+    console.error("Webhook konnte nicht gesetzt werden:", error);
   }
-})();
+});
 
-process.once("SIGINT", () => bot.stop("SIGINT"));
-process.once("SIGTERM", () => bot.stop("SIGTERM"));
+// ================= SHUTDOWN =================
+
+async function flushStateToDiskNow() {
+  try {
+    ensureDataDir();
+    const obj = Object.fromEntries(userState);
+    fs.writeFileSync(STATE_FILE, JSON.stringify(obj, null, 2), "utf8");
+  } catch (error) {
+    console.error("Fehler beim finalen Speichern:", error);
+  }
+}
+
+process.once("SIGINT", async () => {
+  try {
+    await flushStateToDiskNow();
+    await bot.telegram.deleteWebhook();
+  } catch (_) {}
+  process.exit(0);
+});
+
+process.once("SIGTERM", async () => {
+  try {
+    await flushStateToDiskNow();
+    await bot.telegram.deleteWebhook();
+  } catch (_) {}
+  process.exit(0);
+});
