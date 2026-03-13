@@ -1,366 +1,323 @@
-import logging
-from typing import Final
+const TelegramBot = require("node-telegram-bot-api");
 
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    LabeledPrice,
-    BotCommand,
-)
-from telegram.error import TelegramError
-from telegram.ext import (
-    Application,
-    ApplicationBuilder,
-    CommandHandler,
-    CallbackQueryHandler,
-    MessageHandler,
-    ContextTypes,
-    ConversationHandler,
-    PreCheckoutQueryHandler,
-    filters,
-)
+// ================= CONFIG =================
 
-# ================= CONFIG =================
+const TOKEN = "DEIN_NEUER_BOT_TOKEN_HIER";
 
-TOKEN: Final = "DEIN_NEUER_BOT_TOKEN_HIER"
+const CHANNELS = {
+  Fitness: -1003710017996,
+  Premium: -1002309468751,
+  Nutrition: -1002273059833,
+};
 
-CHANNELS: Final = {
-    "Fitness": -1003710017996,
-    "Premium": -1002309468751,
-    "Nutrition": -1002273059833,
+const TIERS = {
+  "25": { stars: 1250, euros: 25 },
+  "50": { stars: 2500, euros: 50 },
+  "100": { stars: 5000, euros: 100 },
+  "150": { stars: 7500, euros: 150 },
+};
+
+// ================= BOT =================
+
+const bot = new TelegramBot(TOKEN, { polling: true });
+
+// user state storage
+const userState = new Map();
+
+// ================= HELPERS =================
+
+function resetUser(userId) {
+  userState.delete(userId);
 }
 
-TIERS: Final = {
-    "25": {"stars": 1250, "euros": 25},
-    "50": {"stars": 2500, "euros": 50},
-    "100": {"stars": 5000, "euros": 100},
-    "150": {"stars": 7500, "euros": 150},
+function getUser(userId) {
+  if (!userState.has(userId)) {
+    userState.set(userId, {});
+  }
+  return userState.get(userId);
 }
 
-# ================= LOGGING =================
-
-logging.basicConfig(
-    format="%(asctime)s | %(name)s | %(levelname)s | %(message)s",
-    level=logging.INFO,
-)
-logger = logging.getLogger(__name__)
-
-# ================= STATES =================
-
-CHOOSE_CHANNEL, CHOOSE_TIER, CHOOSE_MEDIA_TYPE, WAIT_MEDIA = range(4)
-
-# ================= KEYBOARDS =================
-
-def channel_keyboard() -> InlineKeyboardMarkup:
-    rows = [
-        [InlineKeyboardButton(name, callback_data=f"channel:{name}")]
-        for name in CHANNELS.keys()
-    ]
-    rows.append([InlineKeyboardButton("Abbrechen", callback_data="cancel")])
-    return InlineKeyboardMarkup(rows)
-
-
-def tier_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("25€", callback_data="tier:25"),
-                InlineKeyboardButton("50€", callback_data="tier:50"),
-            ],
-            [
-                InlineKeyboardButton("100€", callback_data="tier:100"),
-                InlineKeyboardButton("150€", callback_data="tier:150"),
-            ],
-            [InlineKeyboardButton("Abbrechen", callback_data="cancel")],
-        ]
-    )
-
-
-def media_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("Bild", callback_data="media:photo"),
-                InlineKeyboardButton("Video", callback_data="media:video"),
-            ],
-            [InlineKeyboardButton("Abbrechen", callback_data="cancel")],
-        ]
-    )
-
-# ================= COMMAND SETUP =================
-
-async def post_init(app: Application) -> None:
-    await app.bot.set_my_commands(
-        [
-            BotCommand("start", "Post erstellen"),
-            BotCommand("cancel", "Vorgang abbrechen"),
-            BotCommand("chatid", "Chat-ID anzeigen"),
-        ]
-    )
-
-# ================= COMMANDS =================
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data.clear()
-    await update.effective_message.reply_text(
-        "Wähle zuerst den Kanal, in den gepostet werden soll:",
-        reply_markup=channel_keyboard(),
-    )
-    return CHOOSE_CHANNEL
-
-
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data.clear()
-
-    if update.callback_query:
-        await update.callback_query.answer()
-        await update.callback_query.edit_message_text("Vorgang abgebrochen.")
-    else:
-        await update.effective_message.reply_text("Vorgang abgebrochen.")
-
-    return ConversationHandler.END
-
-
-async def chatid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat = update.effective_chat
-    await update.effective_message.reply_text(
-        f"Chat-ID: {chat.id}\nTyp: {chat.type}\nTitel: {chat.title or '-'}"
-    )
-
-# ================= STEP 1: CHANNEL =================
-
-async def choose_channel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-
-    if query.data == "cancel":
-        return await cancel(update, context)
-
-    if not query.data.startswith("channel:"):
-        await query.edit_message_text("Ungültige Auswahl.")
-        return ConversationHandler.END
-
-    channel_name = query.data.split(":", 1)[1]
-
-    if channel_name not in CHANNELS:
-        await query.edit_message_text("Unbekannter Kanal.")
-        return ConversationHandler.END
-
-    context.user_data["channel_name"] = channel_name
-    context.user_data["channel_id"] = CHANNELS[channel_name]
-
-    await query.edit_message_text(
-        f"Kanal gewählt: {channel_name}\n\nWähle jetzt die Sterne/den Preis:",
-        reply_markup=tier_keyboard(),
-    )
-    return CHOOSE_TIER
-
-# ================= STEP 2: TIER =================
-
-async def choose_tier(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-
-    if query.data == "cancel":
-        return await cancel(update, context)
-
-    if not query.data.startswith("tier:"):
-        await query.edit_message_text("Ungültige Auswahl.")
-        return ConversationHandler.END
-
-    tier_key = query.data.split(":", 1)[1]
-
-    if tier_key not in TIERS:
-        await query.edit_message_text("Unbekannter Preis.")
-        return ConversationHandler.END
-
-    context.user_data["tier_key"] = tier_key
-
-    tier = TIERS[tier_key]
-    await query.edit_message_text(
-        f"Preis gewählt: {tier['euros']}€ / {tier['stars']} Stars\n\n"
-        "Willst du ein Bild oder ein Video senden?",
-        reply_markup=media_keyboard(),
-    )
-    return CHOOSE_MEDIA_TYPE
-
-# ================= STEP 3: MEDIA TYPE =================
-
-async def choose_media_type(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-
-    if query.data == "cancel":
-        return await cancel(update, context)
-
-    if not query.data.startswith("media:"):
-        await query.edit_message_text("Ungültige Auswahl.")
-        return ConversationHandler.END
-
-    media_type = query.data.split(":", 1)[1]
-
-    if media_type not in ("photo", "video"):
-        await query.edit_message_text("Ungültiger Medientyp.")
-        return ConversationHandler.END
-
-    context.user_data["media_type"] = media_type
-
-    text = (
-        "Sende mir jetzt das Bild mit optionaler Caption."
-        if media_type == "photo"
-        else "Sende mir jetzt das Video mit optionaler Caption."
-    )
-
-    await query.edit_message_text(text)
-    return WAIT_MEDIA
-
-# ================= STEP 4: RECEIVE MEDIA =================
-
-async def receive_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if context.user_data.get("media_type") != "photo":
-        await update.effective_message.reply_text("Du hast vorher Video gewählt. Bitte sende ein Video.")
-        return WAIT_MEDIA
-
-    return await _post_media(update, context, kind="photo")
-
-
-async def receive_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if context.user_data.get("media_type") != "video":
-        await update.effective_message.reply_text("Du hast vorher Bild gewählt. Bitte sende ein Bild.")
-        return WAIT_MEDIA
-
-    return await _post_media(update, context, kind="video")
-
-
-async def _post_media(update: Update, context: ContextTypes.DEFAULT_TYPE, kind: str) -> int:
-    msg = update.effective_message
-
-    channel_id = context.user_data.get("channel_id")
-    channel_name = context.user_data.get("channel_name")
-    tier_key = context.user_data.get("tier_key")
-
-    if not channel_id or not channel_name or not tier_key:
-        await msg.reply_text("Fehlende Daten. Bitte /start neu senden.")
-        context.user_data.clear()
-        return ConversationHandler.END
-
-    tier = TIERS[tier_key]
-    caption = msg.caption or ""
-    title = f"{tier['stars']} ⭐ (€{tier['euros']})"
-
-    try:
-        if kind == "photo":
-            file_id = msg.photo[-1].file_id
-            await context.bot.send_photo(
-                chat_id=channel_id,
-                photo=file_id,
-                caption=caption,
-            )
-        else:
-            file_id = msg.video.file_id
-            await context.bot.send_video(
-                chat_id=channel_id,
-                video=file_id,
-                caption=caption,
-            )
-
-        await context.bot.send_invoice(
-            chat_id=channel_id,
-            title=title,
-            description=f"Unlock this content for {tier['stars']} Stars",
-            payload=f"{channel_name}|{tier_key}|{kind}",
-            currency="XTR",
-            prices=[LabeledPrice(title, tier["stars"])],
-        )
-
-        await msg.reply_text(f"✅ Erfolgreich in {channel_name} gepostet.")
-        context.user_data.clear()
-        return ConversationHandler.END
-
-    except TelegramError as e:
-        logger.exception("Telegram-Fehler")
-        await msg.reply_text(
-            "❌ Fehler beim Posten.\n"
-            f"{e}\n\n"
-            "Prüfe:\n"
-            "- Bot ist Admin im Kanal\n"
-            "- Kanal-ID stimmt\n"
-            "- Bot darf Medien senden\n"
-            "- Token ist korrekt"
-        )
-        context.user_data.clear()
-        return ConversationHandler.END
-
-    except Exception as e:
-        logger.exception("Unerwarteter Fehler")
-        await msg.reply_text(f"❌ Unerwarteter Fehler: {e}")
-        context.user_data.clear()
-        return ConversationHandler.END
-
-# ================= OTHER HANDLERS =================
-
-async def wrong_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    media_type = context.user_data.get("media_type")
-
-    if media_type == "photo":
-        await update.effective_message.reply_text("Bitte sende ein Bild.")
-    elif media_type == "video":
-        await update.effective_message.reply_text("Bitte sende ein Video.")
-    else:
-        await update.effective_message.reply_text("Bitte /start neu senden.")
-
-    return WAIT_MEDIA
-
-
-async def precheckout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.pre_checkout_query.answer(ok=True)
-
-
-async def successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.effective_message.reply_text("✅ Zahlung erfolgreich.")
-
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.exception("Unhandled exception", exc_info=context.error)
-
-# ================= MAIN =================
-
-def main() -> None:
-    app = ApplicationBuilder().token(TOKEN).post_init(post_init).build()
-
-    conv = ConversationHandler(
-        entry_points=[CommandHandler("start", start)],
-        states={
-            CHOOSE_CHANNEL: [
-                CallbackQueryHandler(choose_channel, pattern=r"^(channel:|cancel$)")
-            ],
-            CHOOSE_TIER: [
-                CallbackQueryHandler(choose_tier, pattern=r"^(tier:|cancel$)")
-            ],
-            CHOOSE_MEDIA_TYPE: [
-                CallbackQueryHandler(choose_media_type, pattern=r"^(media:|cancel$)")
-            ],
-            WAIT_MEDIA: [
-                MessageHandler(filters.PHOTO, receive_photo),
-                MessageHandler(filters.VIDEO, receive_video),
-                MessageHandler(~(filters.PHOTO | filters.VIDEO), wrong_input),
-            ],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-        allow_reentry=True,
-    )
-
-    app.add_handler(conv)
-    app.add_handler(CommandHandler("cancel", cancel))
-    app.add_handler(CommandHandler("chatid", chatid))
-    app.add_handler(PreCheckoutQueryHandler(precheckout))
-    app.add_handler(
-        MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment)
-    )
-    app.add_error_handler(error_handler)
-
-    print("Bot läuft...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
-
-if __name__ == "__main__":
-    main()
+function channelKeyboard() {
+  const rows = Object.keys(CHANNELS).map((name) => [
+    { text: name, callback_data: `channel:${name}` },
+  ]);
+
+  rows.push([{ text: "Abbrechen", callback_data: "cancel" }]);
+
+  return {
+    inline_keyboard: rows,
+  };
+}
+
+function tierKeyboard() {
+  return {
+    inline_keyboard: [
+      [
+        { text: "25€", callback_data: "tier:25" },
+        { text: "50€", callback_data: "tier:50" },
+      ],
+      [
+        { text: "100€", callback_data: "tier:100" },
+        { text: "150€", callback_data: "tier:150" },
+      ],
+      [{ text: "Abbrechen", callback_data: "cancel" }],
+    ],
+  };
+}
+
+function mediaKeyboard() {
+  return {
+    inline_keyboard: [
+      [
+        { text: "Bild", callback_data: "media:photo" },
+        { text: "Video", callback_data: "media:video" },
+      ],
+      [{ text: "Abbrechen", callback_data: "cancel" }],
+    ],
+  };
+}
+
+async function startFlow(chatId, userId) {
+  resetUser(userId);
+
+  const channelList = Object.keys(CHANNELS)
+    .map((name) => `• ${name}`)
+    .join("\n");
+
+  await bot.sendMessage(
+    chatId,
+    `Ich bin aktuell in diesen 3 Gruppen/Kanälen:\n${channelList}\n\nWähle zuerst aus, wohin gepostet werden soll:`,
+    {
+      reply_markup: channelKeyboard(),
+    }
+  );
+
+  const state = getUser(userId);
+  state.step = "choose_channel";
+}
+
+async function cancelFlow(chatId, userId, messageId = null) {
+  resetUser(userId);
+
+  if (messageId) {
+    try {
+      await bot.editMessageText("Vorgang abgebrochen.", {
+        chat_id: chatId,
+        message_id: messageId,
+      });
+      return;
+    } catch (e) {
+      // fallback below
+    }
+  }
+
+  await bot.sendMessage(chatId, "Vorgang abgebrochen.");
+}
+
+// ================= START / COMMANDS =================
+
+bot.onText(/^\/start$/, async (msg) => {
+  await startFlow(msg.chat.id, msg.from.id);
+});
+
+bot.onText(/^Start$/i, async (msg) => {
+  await startFlow(msg.chat.id, msg.from.id);
+});
+
+bot.onText(/^\/cancel$/, async (msg) => {
+  await cancelFlow(msg.chat.id, msg.from.id);
+});
+
+bot.onText(/^\/chatid$/, async (msg) => {
+  await bot.sendMessage(
+    msg.chat.id,
+    `Chat-ID: ${msg.chat.id}\nTyp: ${msg.chat.type}\nTitel: ${msg.chat.title || "-"}`
+  );
+});
+
+// ================= CALLBACKS =================
+
+bot.on("callback_query", async (query) => {
+  const userId = query.from.id;
+  const chatId = query.message.chat.id;
+  const messageId = query.message.message_id;
+  const data = query.data || "";
+  const state = getUser(userId);
+
+  try {
+    await bot.answerCallbackQuery(query.id);
+  } catch (e) {
+    console.error("answerCallbackQuery error:", e.message);
+  }
+
+  if (data === "cancel") {
+    await cancelFlow(chatId, userId, messageId);
+    return;
+  }
+
+  // STEP 1: CHANNEL
+  if (data.startsWith("channel:")) {
+    const channelName = data.split(":")[1]?.trim();
+
+    if (!CHANNELS[channelName]) {
+      await bot.editMessageText("Unbekannter Kanal.", {
+        chat_id: chatId,
+        message_id: messageId,
+      });
+      resetUser(userId);
+      return;
+    }
+
+    state.channel_name = channelName;
+    state.channel_id = CHANNELS[channelName];
+    state.step = "choose_tier";
+
+    await bot.editMessageText(
+      `Kanal gewählt: ${channelName}\n\nWähle jetzt die Sterne / den Preis:`,
+      {
+        chat_id: chatId,
+        message_id: messageId,
+        reply_markup: tierKeyboard(),
+      }
+    );
+    return;
+  }
+
+  // STEP 2: TIER
+  if (data.startsWith("tier:")) {
+    const tierKey = data.split(":")[1]?.trim();
+
+    if (!TIERS[tierKey]) {
+      await bot.editMessageText("Unbekannter Preis.", {
+        chat_id: chatId,
+        message_id: messageId,
+      });
+      resetUser(userId);
+      return;
+    }
+
+    state.tier_key = tierKey;
+    state.step = "choose_media";
+
+    const tier = TIERS[tierKey];
+
+    await bot.editMessageText(
+      `Preis gewählt: ${tier.euros}€ / ${tier.stars} Stars\n\nWillst du ein Bild oder ein Video senden?`,
+      {
+        chat_id: chatId,
+        message_id: messageId,
+        reply_markup: mediaKeyboard(),
+      }
+    );
+    return;
+  }
+
+  // STEP 3: MEDIA TYPE
+  if (data.startsWith("media:")) {
+    const mediaType = data.split(":")[1]?.trim();
+
+    if (!["photo", "video"].includes(mediaType)) {
+      await bot.editMessageText("Ungültiger Medientyp.", {
+        chat_id: chatId,
+        message_id: messageId,
+      });
+      resetUser(userId);
+      return;
+    }
+
+    state.media_type = mediaType;
+    state.step = "wait_media";
+
+    const text =
+      mediaType === "photo"
+        ? "Sende mir jetzt das Bild mit optionaler Caption."
+        : "Sende mir jetzt das Video mit optionaler Caption.";
+
+    await bot.editMessageText(text, {
+      chat_id: chatId,
+      message_id: messageId,
+    });
+    return;
+  }
+
+  await bot.sendMessage(chatId, "Ungültige Auswahl.");
+});
+
+// ================= MEDIA RECEIVE =================
+
+bot.on("message", async (msg) => {
+  if (!msg.from || !msg.chat) return;
+
+  const userId = msg.from.id;
+  const chatId = msg.chat.id;
+  const state = userState.get(userId);
+
+  if (!state || state.step !== "wait_media") return;
+
+  try {
+    const channelId = state.channel_id;
+    const channelName = state.channel_name;
+    const tierKey = state.tier_key;
+    const mediaType = state.media_type;
+
+    if (!channelId || !channelName || !tierKey || !mediaType) {
+      await bot.sendMessage(chatId, "Fehlende Daten. Bitte /start neu senden.");
+      resetUser(userId);
+      return;
+    }
+
+    const caption = msg.caption || "";
+
+    if (mediaType === "photo") {
+      if (!msg.photo || msg.photo.length === 0) {
+        await bot.sendMessage(chatId, "Bitte sende ein Bild.");
+        return;
+      }
+
+      const largestPhoto = msg.photo[msg.photo.length - 1];
+      const fileId = largestPhoto.file_id;
+
+      await bot.sendPhoto(channelId, fileId, {
+        caption,
+      });
+
+      await bot.sendMessage(chatId, `✅ Erfolgreich in ${channelName} gepostet.`);
+      resetUser(userId);
+      return;
+    }
+
+    if (mediaType === "video") {
+      if (!msg.video) {
+        await bot.sendMessage(chatId, "Bitte sende ein Video.");
+        return;
+      }
+
+      const fileId = msg.video.file_id;
+
+      await bot.sendVideo(channelId, fileId, {
+        caption,
+      });
+
+      await bot.sendMessage(chatId, `✅ Erfolgreich in ${channelName} gepostet.`);
+      resetUser(userId);
+      return;
+    }
+  } catch (e) {
+    console.error("Fehler beim Posten:", e);
+
+    await bot.sendMessage(
+      chatId,
+      "❌ Fehler beim Posten.\n\nPrüfe bitte:\n- Bot ist Admin im Kanal/der Gruppe\n- Chat-ID stimmt\n- Bot darf Medien senden\n- Token ist korrekt"
+    );
+
+    resetUser(userId);
+  }
+});
+
+// ================= ERROR LOGGING =================
+
+bot.on("polling_error", (error) => {
+  console.error("Polling-Fehler:", error);
+});
+
+console.log("Bot läuft...");
