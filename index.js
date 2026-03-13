@@ -1,5 +1,5 @@
 require("dotenv").config();
-const { Telegraf, Markup, session } = require("telegraf");
+const { Telegraf, Markup } = require("telegraf");
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 if (!BOT_TOKEN) {
@@ -7,14 +7,13 @@ if (!BOT_TOKEN) {
 }
 
 const bot = new Telegraf(BOT_TOKEN);
-bot.use(session());
 
 // ================= CONFIG =================
 
 const CHANNELS = {
-  Fitness: -1003710017996,
-  Premium: -1002309468751,
-  Nutrition: -1002273059833,
+  Private: -1003710017996,
+ Extreme: -1002309468751,
+  PrivateVideos: -1002273059833,
 };
 
 const TIERS = {
@@ -24,24 +23,26 @@ const TIERS = {
   "150": { stars: 7500, euros: 150 },
 };
 
-// ================= FLOW STATE =================
+// ================= SIMPLE USER STATE =================
 
-function resetFlow(ctx) {
-  ctx.session.flow = {
+const userState = new Map();
+
+function resetUser(userId) {
+  userState.set(userId, {
     step: "idle",
     channelName: null,
     channelId: null,
     tierKey: null,
     tier: null,
     mediaType: null,
-  };
+  });
 }
 
-function getFlow(ctx) {
-  if (!ctx.session.flow) {
-    resetFlow(ctx);
+function getUser(userId) {
+  if (!userState.has(userId)) {
+    resetUser(userId);
   }
-  return ctx.session.flow;
+  return userState.get(userId);
 }
 
 // ================= KEYBOARDS =================
@@ -52,7 +53,6 @@ function channelsKeyboard() {
   ]);
 
   rows.push([Markup.button.callback("Abbrechen", "cancel")]);
-
   return Markup.inlineKeyboard(rows);
 }
 
@@ -73,7 +73,7 @@ function tiersKeyboard() {
   ]);
 }
 
-function mediaChoiceKeyboard() {
+function mediaKeyboard() {
   return Markup.inlineKeyboard([
     [
       Markup.button.callback("Bild", "media:photo"),
@@ -87,10 +87,10 @@ function mediaChoiceKeyboard() {
   ]);
 }
 
-function waitingUploadKeyboard() {
+function waitUploadKeyboard() {
   return Markup.inlineKeyboard([
     [
-      Markup.button.callback("← Zurück", "back:media-choice"),
+      Markup.button.callback("← Zurück", "back:media"),
       Markup.button.callback("Abbrechen", "cancel"),
     ],
   ]);
@@ -98,21 +98,29 @@ function waitingUploadKeyboard() {
 
 // ================= UI HELPERS =================
 
-async function safeEditOrReply(ctx, text, extra = {}) {
+async function safeAnswerCb(ctx) {
   try {
-    if (ctx.callbackQuery?.message) {
-      return await ctx.editMessageText(text, extra);
+    if (ctx.callbackQuery) {
+      await ctx.answerCbQuery();
     }
-  } catch (error) {
-    // Fallback auf reply
+  } catch (_) {}
+}
+
+async function safeEditOrReply(ctx, text, markup) {
+  const extra = markup ? { reply_markup: markup.reply_markup } : {};
+
+  if (ctx.callbackQuery?.message) {
+    try {
+      return await ctx.editMessageText(text, extra);
+    } catch (_) {}
   }
 
   return await ctx.reply(text, extra);
 }
 
-async function showChannels(ctx) {
-  const flow = getFlow(ctx);
-  flow.step = "choose_channel";
+async function showChannels(ctx, userId) {
+  const state = getUser(userId);
+  state.step = "choose_channel";
 
   const list = Object.keys(CHANNELS)
     .map((name) => `• ${name}`)
@@ -125,105 +133,112 @@ async function showChannels(ctx) {
   );
 }
 
-async function showTiers(ctx) {
-  const flow = getFlow(ctx);
+async function showTiers(ctx, userId) {
+  const state = getUser(userId);
 
-  if (!flow.channelId || !flow.channelName) {
-    return showChannels(ctx);
+  if (!state.channelId || !state.channelName) {
+    return showChannels(ctx, userId);
   }
 
-  flow.step = "choose_tier";
+  state.step = "choose_tier";
 
   await safeEditOrReply(
     ctx,
-    `Ziel: ${flow.channelName}\n\nWähle jetzt die Sterne / den Preis:`,
+    `Ziel: ${state.channelName}\n\nWähle jetzt die Sterne / den Preis:`,
     tiersKeyboard()
   );
 }
 
-async function showMediaChoice(ctx) {
-  const flow = getFlow(ctx);
+async function showMedia(ctx, userId) {
+  const state = getUser(userId);
 
-  if (!flow.channelId || !flow.channelName || !flow.tierKey || !flow.tier) {
-    return showTiers(ctx);
+  if (!state.channelId || !state.tier) {
+    return showTiers(ctx, userId);
   }
 
-  flow.step = "choose_media";
+  state.step = "choose_media";
 
   await safeEditOrReply(
     ctx,
-    `Ziel: ${flow.channelName}\nPreis: ${flow.tier.euros}€ / ${flow.tier.stars} ⭐\n\nWillst du ein Bild, ein Video oder kein Medium senden?`,
-    mediaChoiceKeyboard()
+    `Ziel: ${state.channelName}\nPreis: ${state.tier.euros}€ / ${state.tier.stars} ⭐\n\nWillst du ein Bild, ein Video oder kein Medium senden?`,
+    mediaKeyboard()
   );
 }
 
-async function askForUpload(ctx, mediaType) {
-  const flow = getFlow(ctx);
-  flow.step = "wait_media";
-  flow.mediaType = mediaType;
+async function askForUpload(ctx, userId, mediaType) {
+  const state = getUser(userId);
+  state.step = "wait_media";
+  state.mediaType = mediaType;
 
   const text =
     mediaType === "photo"
-      ? `Sende jetzt bitte ein Bild.\n\nZiel: ${flow.channelName}\nPreis: ${flow.tier.euros}€ / ${flow.tier.stars} ⭐`
-      : `Sende jetzt bitte ein Video.\n\nZiel: ${flow.channelName}\nPreis: ${flow.tier.euros}€ / ${flow.tier.stars} ⭐`;
+      ? `Sende jetzt bitte ein Bild.\n\nZiel: ${state.channelName}\nPreis: ${state.tier.euros}€ / ${state.tier.stars} ⭐`
+      : `Sende jetzt bitte ein Video.\n\nZiel: ${state.channelName}\nPreis: ${state.tier.euros}€ / ${state.tier.stars} ⭐`;
 
-  await safeEditOrReply(ctx, text, waitingUploadKeyboard());
+  await safeEditOrReply(ctx, text, waitUploadKeyboard());
 }
 
-// ================= TELEGRAM STARS / INVOICE =================
+// ================= TELEGRAM API HELPERS =================
 
-async function sendStarsInvoice({
-  chatId,
-  channelName,
-  tierKey,
-  mediaType = "none",
-}) {
+async function sendStarsInvoice({ chatId, channelName, tierKey, mediaType = "none" }) {
   const tier = TIERS[tierKey];
 
-  const title = `${tier.stars} ⭐`;
-  const description = `Freischalten für ${tier.euros}€ / ${tier.stars} Stars`;
-
-  // Für digitale Güter mit Stars:
-  // - currency = "XTR"
-  // - provider_token leer/weg
-  // - genau die Star-Anzahl als amount
-  return bot.telegram.sendInvoice(
-    chatId,
-    title,
-    description,
-    JSON.stringify({
+  return await bot.telegram.callApi("sendInvoice", {
+    chat_id: chatId,
+    title: `${tier.stars} ⭐`,
+    description: `Freischalten für ${tier.euros}€ / ${tier.stars} Stars`,
+    payload: JSON.stringify({
       channelName,
       tierKey,
+      mediaType,
       stars: tier.stars,
       euros: tier.euros,
-      mediaType,
       createdAt: Date.now(),
     }),
-    undefined,
-    "XTR",
-    [
+    currency: "XTR",
+    prices: [
       {
-        label: title,
+        label: `${tier.stars} ⭐`,
         amount: tier.stars,
       },
-    ]
-  );
+    ],
+  });
 }
 
-// ================= START / COMMANDS =================
+async function sendPhoto(chatId, fileId, caption = "") {
+  return await bot.telegram.callApi("sendPhoto", {
+    chat_id: chatId,
+    photo: fileId,
+    caption,
+  });
+}
+
+async function sendVideo(chatId, fileId, caption = "") {
+  return await bot.telegram.callApi("sendVideo", {
+    chat_id: chatId,
+    video: fileId,
+    caption,
+  });
+}
+
+// ================= START =================
+
+async function startFlow(ctx) {
+  const userId = ctx.from.id;
+  resetUser(userId);
+  await showChannels(ctx, userId);
+}
 
 bot.start(async (ctx) => {
-  resetFlow(ctx);
-  await showChannels(ctx);
+  await startFlow(ctx);
 });
 
 bot.hears(/^start$/i, async (ctx) => {
-  resetFlow(ctx);
-  await showChannels(ctx);
+  await startFlow(ctx);
 });
 
 bot.command("cancel", async (ctx) => {
-  resetFlow(ctx);
+  resetUser(ctx.from.id);
   await ctx.reply("Vorgang abgebrochen.");
 });
 
@@ -236,208 +251,209 @@ bot.command("chatid", async (ctx) => {
 // ================= CALLBACKS =================
 
 bot.action("cancel", async (ctx) => {
-  await ctx.answerCbQuery();
-  resetFlow(ctx);
+  await safeAnswerCb(ctx);
+  resetUser(ctx.from.id);
   await safeEditOrReply(ctx, "Vorgang abgebrochen.");
 });
 
 bot.action("back:channels", async (ctx) => {
-  await ctx.answerCbQuery();
-  await showChannels(ctx);
+  await safeAnswerCb(ctx);
+  await showChannels(ctx, ctx.from.id);
 });
 
 bot.action("back:tiers", async (ctx) => {
-  await ctx.answerCbQuery();
-  await showTiers(ctx);
+  await safeAnswerCb(ctx);
+  await showTiers(ctx, ctx.from.id);
 });
 
-bot.action("back:media-choice", async (ctx) => {
-  await ctx.answerCbQuery();
-  await showMediaChoice(ctx);
+bot.action("back:media", async (ctx) => {
+  await safeAnswerCb(ctx);
+  await showMedia(ctx, ctx.from.id);
 });
 
 bot.action(/^channel:(.+)$/, async (ctx) => {
-  await ctx.answerCbQuery();
+  await safeAnswerCb(ctx);
 
-  const flow = getFlow(ctx);
+  const userId = ctx.from.id;
+  const state = getUser(userId);
   const channelName = ctx.match[1];
 
   if (!(channelName in CHANNELS)) {
-    resetFlow(ctx);
+    resetUser(userId);
     return safeEditOrReply(ctx, "Unbekannte Gruppe / unbekannter Kanal.");
   }
 
-  flow.channelName = channelName;
-  flow.channelId = CHANNELS[channelName];
-  flow.tierKey = null;
-  flow.tier = null;
-  flow.mediaType = null;
+  state.channelName = channelName;
+  state.channelId = CHANNELS[channelName];
+  state.tierKey = null;
+  state.tier = null;
+  state.mediaType = null;
 
-  await showTiers(ctx);
+  await showTiers(ctx, userId);
 });
 
 bot.action(/^tier:(25|50|100|150)$/, async (ctx) => {
-  await ctx.answerCbQuery();
+  await safeAnswerCb(ctx);
 
-  const flow = getFlow(ctx);
+  const userId = ctx.from.id;
+  const state = getUser(userId);
   const tierKey = ctx.match[1];
 
-  if (!flow.channelId || !flow.channelName) {
-    resetFlow(ctx);
+  if (!state.channelId) {
+    resetUser(userId);
     return safeEditOrReply(ctx, "Bitte starte neu und wähle zuerst eine Gruppe.");
   }
 
-  if (!(tierKey in TIERS)) {
-    return safeEditOrReply(ctx, "Ungültiger Preis.");
-  }
+  state.tierKey = tierKey;
+  state.tier = TIERS[tierKey];
+  state.mediaType = null;
 
-  flow.tierKey = tierKey;
-  flow.tier = TIERS[tierKey];
-  flow.mediaType = null;
-
-  await showMediaChoice(ctx);
+  await showMedia(ctx, userId);
 });
 
 bot.action(/^media:(photo|video|none)$/, async (ctx) => {
-  await ctx.answerCbQuery();
+  await safeAnswerCb(ctx);
 
-  const flow = getFlow(ctx);
+  const userId = ctx.from.id;
+  const state = getUser(userId);
   const mediaType = ctx.match[1];
 
-  if (!flow.channelId || !flow.channelName || !flow.tierKey || !flow.tier) {
-    resetFlow(ctx);
+  if (!state.channelId || !state.channelName || !state.tierKey || !state.tier) {
+    resetUser(userId);
     return safeEditOrReply(ctx, "Bitte starte neu. Auswahl unvollständig.");
   }
 
   if (mediaType === "none") {
     try {
       await sendStarsInvoice({
-        chatId: flow.channelId,
-        channelName: flow.channelName,
-        tierKey: flow.tierKey,
+        chatId: state.channelId,
+        channelName: state.channelName,
+        tierKey: state.tierKey,
         mediaType: "none",
       });
 
-      const confirmation =
-        `✅ Erfolgreich gesendet.\n\n` +
-        `Ziel: ${flow.channelName}\n` +
-        `Preis: ${flow.tier.euros}€ / ${flow.tier.stars} ⭐\n` +
-        `Medium: keines\n\n` +
-        `Die Kaufmöglichkeit läuft über die separate Invoice-Nachricht.`;
+      resetUser(userId);
 
-      resetFlow(ctx);
-      return safeEditOrReply(ctx, confirmation);
+      return await safeEditOrReply(
+        ctx,
+        `✅ Erfolgreich gesendet.\n\nZiel: ${state.channelName}\nPreis: ${state.tier.euros}€ / ${state.tier.stars} ⭐\nMedium: keines\n\nDie Kaufmöglichkeit erscheint in der separaten Invoice-Nachricht.`
+      );
     } catch (error) {
       console.error("Invoice-Fehler:", error);
-      resetFlow(ctx);
-      return safeEditOrReply(
+      resetUser(userId);
+      return await safeEditOrReply(
         ctx,
-        "❌ Fehler beim Senden der Stars-Invoice.\n\nPrüfe:\n- Bot ist Admin im Kanal/der Gruppe\n- Chat-ID stimmt\n- XTR/Stars ist korrekt eingerichtet"
+        "❌ Fehler beim Senden der Stars-Invoice.\n\nPrüfe:\n- Bot ist Admin im Kanal/der Gruppe\n- Chat-ID stimmt\n- Stars/XTR ist korrekt eingerichtet"
       );
     }
   }
 
-  await askForUpload(ctx, mediaType);
+  await askForUpload(ctx, userId, mediaType);
 });
 
-// ================= MEDIA EMPFANG =================
+// ================= MEDIA RECEIVE =================
 
 bot.on("photo", async (ctx) => {
-  const flow = getFlow(ctx);
+  const userId = ctx.from.id;
+  const state = getUser(userId);
 
-  if (flow.step !== "wait_media") return;
+  if (state.step !== "wait_media") return;
 
-  if (flow.mediaType !== "photo") {
-    return ctx.reply(
+  if (state.mediaType !== "photo") {
+    return await ctx.reply(
       "Du hast Video gewählt. Bitte sende ein Video.",
-      waitingUploadKeyboard()
+      { reply_markup: waitUploadKeyboard().reply_markup }
     );
   }
 
   try {
     const photo = ctx.message.photo?.[ctx.message.photo.length - 1];
     if (!photo) {
-      return ctx.reply("Kein Bild gefunden.", waitingUploadKeyboard());
+      return await ctx.reply("Kein Bild gefunden.");
     }
 
     const caption = ctx.message.caption || "";
 
-    await bot.telegram.sendPhoto(flow.channelId, photo.file_id, { caption });
+    await sendPhoto(state.channelId, photo.file_id, caption);
 
     await sendStarsInvoice({
-      chatId: flow.channelId,
-      channelName: flow.channelName,
-      tierKey: flow.tierKey,
+      chatId: state.channelId,
+      channelName: state.channelName,
+      tierKey: state.tierKey,
       mediaType: "photo",
     });
 
     await ctx.reply(
-      `✅ Erfolgreich gesendet.\n\nZiel: ${flow.channelName}\nPreis: ${flow.tier.euros}€ / ${flow.tier.stars} ⭐\nMedium: Bild\n\nDie Kaufmöglichkeit steht in der nächsten Invoice-Nachricht.`
+      `✅ Erfolgreich gesendet.\n\nZiel: ${state.channelName}\nPreis: ${state.tier.euros}€ / ${state.tier.stars} ⭐\nMedium: Bild\n\nDie Kaufmöglichkeit steht in der separaten Invoice-Nachricht.`
     );
 
-    resetFlow(ctx);
+    resetUser(userId);
   } catch (error) {
     console.error("Foto-Fehler:", error);
-    resetFlow(ctx);
+    resetUser(userId);
     await ctx.reply(
-      "❌ Fehler beim Senden.\n\nPrüfe:\n- Bot ist Admin im Kanal/der Gruppe\n- Chat-ID stimmt\n- Bot darf Medien senden\n- XTR/Stars ist korrekt eingerichtet"
+      "❌ Fehler beim Senden.\n\nPrüfe:\n- Bot ist Admin im Kanal/der Gruppe\n- Chat-ID stimmt\n- Bot darf Medien senden\n- Stars/XTR ist korrekt eingerichtet"
     );
   }
 });
 
 bot.on("video", async (ctx) => {
-  const flow = getFlow(ctx);
+  const userId = ctx.from.id;
+  const state = getUser(userId);
 
-  if (flow.step !== "wait_media") return;
+  if (state.step !== "wait_media") return;
 
-  if (flow.mediaType !== "video") {
-    return ctx.reply(
+  if (state.mediaType !== "video") {
+    return await ctx.reply(
       "Du hast Bild gewählt. Bitte sende ein Bild.",
-      waitingUploadKeyboard()
+      { reply_markup: waitUploadKeyboard().reply_markup }
     );
   }
 
   try {
     const video = ctx.message.video;
     if (!video) {
-      return ctx.reply("Kein Video gefunden.", waitingUploadKeyboard());
+      return await ctx.reply("Kein Video gefunden.");
     }
 
     const caption = ctx.message.caption || "";
 
-    await bot.telegram.sendVideo(flow.channelId, video.file_id, { caption });
+    await sendVideo(state.channelId, video.file_id, caption);
 
     await sendStarsInvoice({
-      chatId: flow.channelId,
-      channelName: flow.channelName,
-      tierKey: flow.tierKey,
+      chatId: state.channelId,
+      channelName: state.channelName,
+      tierKey: state.tierKey,
       mediaType: "video",
     });
 
     await ctx.reply(
-      `✅ Erfolgreich gesendet.\n\nZiel: ${flow.channelName}\nPreis: ${flow.tier.euros}€ / ${flow.tier.stars} ⭐\nMedium: Video\n\nDie Kaufmöglichkeit steht in der nächsten Invoice-Nachricht.`
+      `✅ Erfolgreich gesendet.\n\nZiel: ${state.channelName}\nPreis: ${state.tier.euros}€ / ${state.tier.stars} ⭐\nMedium: Video\n\nDie Kaufmöglichkeit steht in der separaten Invoice-Nachricht.`
     );
 
-    resetFlow(ctx);
+    resetUser(userId);
   } catch (error) {
     console.error("Video-Fehler:", error);
-    resetFlow(ctx);
+    resetUser(userId);
     await ctx.reply(
-      "❌ Fehler beim Senden.\n\nPrüfe:\n- Bot ist Admin im Kanal/der Gruppe\n- Chat-ID stimmt\n- Bot darf Medien senden\n- XTR/Stars ist korrekt eingerichtet"
+      "❌ Fehler beim Senden.\n\nPrüfe:\n- Bot ist Admin im Kanal/der Gruppe\n- Chat-ID stimmt\n- Bot darf Medien senden\n- Stars/XTR ist korrekt eingerichtet"
     );
   }
 });
 
-// Falsche Eingaben während Upload
+// Falsche Eingabe nur dann abfangen, wenn der User gerade im Upload-Schritt ist
 bot.on("message", async (ctx, next) => {
-  const flow = getFlow(ctx);
+  const userId = ctx.from?.id;
+  if (!userId) return next();
 
-  if (flow.step === "wait_media") {
-    return ctx.reply(
-      flow.mediaType === "photo"
+  const state = getUser(userId);
+
+  if (state.step === "wait_media") {
+    return await ctx.reply(
+      state.mediaType === "photo"
         ? "Bitte sende jetzt ein Bild oder nutze Zurück/Abbrechen."
         : "Bitte sende jetzt ein Video oder nutze Zurück/Abbrechen.",
-      waitingUploadKeyboard()
+      { reply_markup: waitUploadKeyboard().reply_markup }
     );
   }
 
@@ -446,7 +462,6 @@ bot.on("message", async (ctx, next) => {
 
 // ================= PAYMENT EVENTS =================
 
-// Telegram verlangt, dass pre_checkout_query beantwortet wird
 bot.on("pre_checkout_query", async (ctx) => {
   try {
     await ctx.answerPreCheckoutQuery(true);
@@ -455,32 +470,34 @@ bot.on("pre_checkout_query", async (ctx) => {
   }
 });
 
-// Erfolgreiche Zahlung
 bot.on("successful_payment", async (ctx) => {
-  const payment = ctx.message.successful_payment;
+  try {
+    const payment = ctx.message.successful_payment;
 
-  await ctx.reply(
-    `✅ Zahlung erfolgreich.\n\n` +
-      `Währung: ${payment.currency}\n` +
-      `Betrag: ${payment.total_amount}\n` +
-      `Charge-ID: ${payment.telegram_payment_charge_id}`
-  );
+    await ctx.reply(
+      `✅ Zahlung erfolgreich.\n\nWährung: ${payment.currency}\nBetrag: ${payment.total_amount}\nCharge-ID: ${payment.telegram_payment_charge_id}`
+    );
+  } catch (error) {
+    console.error("Successful-Payment-Fehler:", error);
+  }
 });
 
 // ================= ERROR HANDLING =================
 
-bot.catch((err, ctx) => {
-  console.error("Bot-Fehler:", err);
-
-  if (ctx?.reply) {
-    ctx.reply("❌ Interner Fehler. Bitte versuche es erneut.").catch(() => {});
-  }
+bot.catch((error) => {
+  console.error("BOT CRASH / ERROR:", error);
 });
 
 // ================= START BOT =================
 
-bot.launch();
-console.log("Bot läuft...");
+(async () => {
+  try {
+    await bot.launch();
+    console.log("Bot läuft...");
+  } catch (error) {
+    console.error("Startfehler:", error);
+  }
+})();
 
 process.once("SIGINT", () => bot.stop("SIGINT"));
 process.once("SIGTERM", () => bot.stop("SIGTERM"));
