@@ -30,7 +30,7 @@ const showMainMenu = async (ctx, textPrefix = "👋 Willkommen") => {
   await ctx.reply(
     `${textPrefix}, ${username}!\n\nWähle deinen Plan:`,
     Markup.inlineKeyboard([
-      [Markup.button.callback("⭐ 1250 Stars – 25 €", "STAR_1500")],
+      [Markup.button.callback("⭐ 1250 Stars – 25 €", "STAR_1250")],
       [Markup.button.callback("⭐ 2500 Stars – 50 €", "STAR_2500")],
       [Markup.button.callback("⭐ 5000 Stars – 100 €", "STAR_5000")],
       [Markup.button.callback("⭐ 7500 Stars – 150 €", "STAR_7500")]
